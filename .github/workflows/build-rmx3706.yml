@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       KSU_CONFIG:
-        description: "选择 SukiSU 分支"
+        description: "SukiSU 分支"
         required: true
         type: choice
         options:
@@ -59,7 +59,7 @@ jobs:
           remove-haskell: 'true'
           remove-codeql: 'true'
 
-      - name: Configure Git & Install dependencies
+      - name: Install dependencies (Azure mirror)
         run: |
           git config --global user.name "build-bot"
           git config --global user.email "bot@localhost"
@@ -73,48 +73,63 @@ jobs:
             python3 git curl wget unzip zip xz-utils zstd bc bison flex \
             libssl-dev libelf-dev libncurses-dev make ccache dwarves pahole rsync
 
-      - name: Install repo tool
-        run: |
-          curl -sSL https://storage.googleapis.com/git-repo-downloads/repo > ~/repo
-          chmod a+x ~/repo
-          sudo mv ~/repo /usr/local/bin/repo
-
-      - name: Pull OPPO SM8475 kernel source
-        run: |
-          mkdir -p kernel_workspace/kernel_platform
-          cd kernel_workspace/kernel_platform
-          git clone --depth=1 https://github.com/oppo-source/android_kernel_common_oppo_sm8475 \
-            -b oppo/sm8475_b_16.0_reno9_pro_plus common
-          git clone --depth=1 https://github.com/oppo-source/android_kernel_oppo_sm8475 \
-            -b oppo/sm8475_b_16.0_reno9_pro_plus msm-kernel
-          sed -i 's/ -dirty//g' common/scripts/setlocalversion || true
-          sed -i 's/ -dirty//g' msm-kernel/scripts/setlocalversion || true
-          sed -i '$i res=$(echo "$res" | sed '\''s/-dirty//g'\'')' common/scripts/setlocalversion || true
-          # 关键修复: OPPO 开源不完整, 缺 kernel/oplus_cpu (vendor/oplus/kernel/cpu)
-          # 创建占位 Kconfig, 让 Kconfig 解析通过 (GKI 编译不需要 OPLUS 私有调度)
-          rm -rf common/kernel/oplus_cpu
-          mkdir -p common/kernel/oplus_cpu/sched
-          echo "# placeholder for OPLUS private cpu sched (not open-sourced)" > common/kernel/oplus_cpu/sched/Kconfig
-          echo 'source "kernel/oplus_cpu/sched/Kconfig"' > /dev/null
-          # 同时检查其他可能缺失的 oplus 引用, 创建占位
-          for d in oplus_mpam oplus_tencent oplus_sys oplus_healthinfo oplus_chg oplus_display oplus_secure; do
-            rm -rf common/kernel/$d
-            mkdir -p common/kernel/$d
-            touch common/kernel/$d/Kconfig
-          done
-
-      - name: Download prebuilt clang
+      - name: Download prebuilt clang r416183b
         run: |
           mkdir -p kernel_workspace/prebuilts-master/clang/host/linux-x86
           cd kernel_workspace/prebuilts-master/clang/host/linux-x86
           curl -L --retry 5 --retry-delay 5 -o clang-r416183b.tar.gz \
             "https://gitlab.com/CalyxOS/platform_prebuilts_clang_kernel_linux-x86_clang-r416183b/-/archive/android14/platform_prebuilts_clang_kernel_linux-x86_clang-r416183b-android14.tar.gz"
-          ls -la clang-r416183b.tar.gz
           mkdir -p clang-r416183b
           tar -xzf clang-r416183b.tar.gz -C clang-r416183b --strip-components=1 || tar -xzf clang-r416183b.tar.gz -C clang-r416183b
           rm -f clang-r416183b.tar.gz
-          ls -la clang-r416183b/bin/clang | head -1
-          clang-r416183b/bin/clang --version | head -2 || true
+          clang-r416183b/bin/clang --version | head -1
+
+      - name: Pull kernel source + patches
+        run: |
+          mkdir -p kernel_workspace/kernel_platform
+          cd kernel_workspace/kernel_platform
+          # OPPO SM8475 官方开源内核 (Android 16 / 5.10.236)
+          git clone --depth=1 https://github.com/oppo-source/android_kernel_common_oppo_sm8475 \
+            -b oppo/sm8475_b_16.0_reno9_pro_plus common
+          git clone --depth=1 https://github.com/oppo-source/android_kernel_oppo_sm8475 \
+            -b oppo/sm8475_b_16.0_reno9_pro_plus msm-kernel
+          # SukiSU 补丁仓库
+          git clone --depth=1 https://github.com/SukiSU-Ultra/SukiSU_patch.git
+          # SUSFS 补丁仓库
+          git clone --depth=1 -b gki-android12-5.10 https://github.com/ShirkNeko/susfs4ksu.git
+          # 去除 -dirty 后缀
+          sed -i 's/ -dirty//g' common/scripts/setlocalversion || true
+          sed -i '$i res=$(echo "$res" | sed '\''s/-dirty//g'\'')' common/scripts/setlocalversion || true
+
+      - name: Convert OGKI to GKI (hmbird patch)
+        run: |
+          cd kernel_workspace/kernel_platform/common
+          # OPPO 魔改 GKI(OGKI) 转标准 GKI, 移除对未开源 oplus 私有代码的依赖
+          sed -i '1iobj-y += hmbird_patch.o' drivers/Makefile
+          curl -L --retry 5 --retry-delay 3 -o hmbird_patch.patch \
+            "https://raw.githubusercontent.com/TNTyep520/Actions_SukiSU_oppo_kernel_sm8475/SukiSU-Ultra/Patches/hmbird_patch.patch"
+          ls -la hmbird_patch.patch
+          patch -p1 -F 3 < hmbird_patch.patch || echo "hmbird patch may partially apply, continuing..."
+
+      - name: Auto-fix missing Kconfig references
+        run: |
+          cd kernel_workspace/kernel_platform/common
+          # 扫描所有 Kconfig 的 source 引用, 为缺失路径自动创建占位
+          # 解决 OPPO 开源不完整导致的 "can't open file" 报错
+          grep -rhoE '^[[:space:]]*source[[:space:]]+"[^"]+"' --include="Kconfig" . 2>/dev/null \
+            | sed -E 's/^[[:space:]]*source[[:space:]]+"//; s/"$//' \
+            | sort -u > /tmp/kconfig_sources.txt
+          echo "Total Kconfig source refs: $(wc -l < /tmp/kconfig_sources.txt)"
+          while IFS= read -r path; do
+            [ -z "$path" ] && continue
+            # 跳过含变量的路径
+            case "$path" in *'$'*) continue ;; esac
+            if [ ! -f "$path" ]; then
+              mkdir -p "$(dirname "$path")"
+              echo "# placeholder for missing (OPLUS private) Kconfig" > "$path"
+              echo "Created placeholder: $path"
+            fi
+          done < /tmp/kconfig_sources.txt
 
       - name: Add SukiSU Ultra
         run: |
@@ -133,23 +148,21 @@ jobs:
       - name: Apply SUSFS patches
         if: ${{ inputs.SUSFS == 'enable' }}
         run: |
-          cd kernel_workspace
-          git clone https://github.com/ShirkNeko/susfs4ksu.git -b gki-android12-5.10 susfs4ksu
-          git clone https://github.com/SukiSU-Ultra/SukiSU_patch.git
-          cd kernel_platform/common
-          cp ../../susfs4ksu/kernel_patches/50_add_susfs_in_gki-android12-5.10.patch ./
-          cp ../../susfs4ksu/kernel_patches/fs/* ./fs/ 2>/dev/null || true
-          cp ../../susfs4ksu/kernel_patches/include/linux/* ./include/linux/ 2>/dev/null || true
-          patch -p1 -F 3 < 50_add_susfs_in_gki-android12-5.10.patch || true
+          cd kernel_workspace/kernel_platform
+          cp ../susfs4ksu/kernel_patches/50_add_susfs_in_gki-android12-5.10.patch ./common/
+          cp ../susfs4ksu/kernel_patches/fs/* ./common/fs/ 2>/dev/null || true
+          cp ../susfs4ksu/kernel_patches/include/linux/* ./common/include/linux/ 2>/dev/null || true
+          cd ./common
+          patch -p1 -F 3 < 50_add_susfs_in_gki-android12-5.10.patch || echo "susfs patch may partially apply"
           cp ../../SukiSU_patch/69_hide_stuff.patch ./
-          patch -p1 -F 3 < 69_hide_stuff.patch || true
+          patch -p1 -F 3 < 69_hide_stuff.patch || echo "hide_stuff may partially apply"
 
       - name: Apply VFS patches
         if: ${{ inputs.VFS == 'enable' }}
         run: |
           cd kernel_workspace/kernel_platform/common
           cp ../../SukiSU_patch/hooks/syscall_hooks.patch ./
-          patch -p1 -F 3 < syscall_hooks.patch || true
+          patch -p1 -F 3 < syscall_hooks.patch || echo "vfs may partially apply"
 
       - name: Apply lz4/zstd patches
         if: ${{ inputs.LZ4_ZSTD == 'enable' }}
@@ -203,7 +216,6 @@ jobs:
             echo "CONFIG_NET_SCH_FQ=y" >> "$CONFIG_FILE"
           fi
           sed -i 's/check_defconfig//' ./common/build.config.gki || true
-          sed -i 's/check_defconfig//' ./msm-kernel/build.config.gki 2>/dev/null || true
 
       - name: Build Kernel
         run: |
@@ -214,18 +226,10 @@ jobs:
           MAKE_ARGS="LLVM=1 LLVM_IAS=1 ARCH=arm64 \
             CROSS_COMPILE=aarch64-linux-gnu- \
             LD=ld.lld HOSTLD=ld.lld KCFLAGS+=-Wno-error"
-          make -j$(nproc --all) O=out $MAKE_ARGS gki_defconfig || {
-            echo "=== gki_defconfig 失败, 显示详细错误 ==="
-            make O=out $MAKE_ARGS gki_defconfig 2>&1 | tail -50
-            exit 1
-          }
-          make -j$(nproc --all) O=out $MAKE_ARGS || {
-            echo "=== 编译失败, 显示详细错误 ==="
-            make O=out $MAKE_ARGS 2>&1 | tail -80
-            exit 1
-          }
+          make -j$(nproc --all) O=out $MAKE_ARGS gki_defconfig 2>&1 | tail -60
+          make -j$(nproc --all) O=out $MAKE_ARGS 2>&1 | tail -80
           ccache -s
-          find out -name "Image" -o -name "Image.gz" -o -name "*.ko" | head -20
+          find out -name "Image" -o -name "Image.gz" | head -10
 
       - name: Package AnyKernel3
         run: |
@@ -240,7 +244,6 @@ jobs:
             cp "$image_path" ./AnyKernel3/Image
           else
             echo "Image not found! Build failed" >&2
-            find "$GITHUB_WORKSPACE/kernel_workspace/kernel_platform/common/out/" -maxdepth 3 -type f | head -30
             exit 1
           fi
 
