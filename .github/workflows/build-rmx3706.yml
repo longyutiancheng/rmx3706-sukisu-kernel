@@ -63,14 +63,16 @@ jobs:
         run: |
           git config --global user.name "build-bot"
           git config --global user.email "bot@localhost"
-          # 换成清华镜像源 (GitHub runner 访问 archive.ubuntu.com 经常很慢/卡死)
-          sudo sed -i 's|http://archive.ubuntu.com/ubuntu|https://mirrors.tuna.tsinghua.edu.cn/ubuntu|g' /etc/apt/sources.list.d/ubuntu.sources 2>/dev/null || true
-          sudo sed -i 's|http://security.ubuntu.com/ubuntu|https://mirrors.tuna.tsinghua.edu.cn/ubuntu|g' /etc/apt/sources.list.d/ubuntu.sources 2>/dev/null || true
-          sudo sed -i 's|http://archive.ubuntu.com/ubuntu|https://mirrors.tuna.tsinghua.edu.cn/ubuntu|g' /etc/apt/sources.list 2>/dev/null || true
-          sudo sed -i 's|http://security.ubuntu.com/ubuntu|https://mirrors.tuna.tsinghua.edu.cn/ubuntu|g' /etc/apt/sources.list 2>/dev/null || true
-          # 不执行 apt upgrade (太慢), 只安装必需依赖
-          sudo apt update -y
+          # 关键修复: GitHub runner 在 Azure 上, 改用 azure.archive.ubuntu.com 镜像 (速度最快)
+          # 同时给 apt 加超时和重试, 避免卡死
+          sudo sed -i 's|http://archive.ubuntu.com/ubuntu|http://azure.archive.ubuntu.com/ubuntu|g' /etc/apt/sources.list.d/ubuntu.sources 2>/dev/null || true
+          sudo sed -i 's|http://security.ubuntu.com/ubuntu|http://azure.archive.ubuntu.com/ubuntu|g' /etc/apt/sources.list.d/ubuntu.sources 2>/dev/null || true
+          sudo sed -i 's|http://archive.ubuntu.com/ubuntu|http://azure.archive.ubuntu.com/ubuntu|g' /etc/apt/sources.list 2>/dev/null || true
+          sudo sed -i 's|http://security.ubuntu.com/ubuntu|http://azure.archive.ubuntu.com/ubuntu|g' /etc/apt/sources.list 2>/dev/null || true
+          # 不执行 apt upgrade (太慢), 只安装必需依赖, 带超时重试
+          sudo apt update -o Acquire::Retries=5 -o Acquire::http::Timeout=30 -y
           sudo DEBIAN_FRONTEND=noninteractive apt install -y --no-install-recommends \
+            -o Acquire::Retries=5 -o Acquire::http::Timeout=30 \
             python3 git curl wget unzip zip xz-utils zstd bc bison flex \
             libssl-dev libelf-dev libncurses-dev make ccache dwarves pahole rsync
 
