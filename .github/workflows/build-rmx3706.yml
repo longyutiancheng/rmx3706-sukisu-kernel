@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       KSU_CONFIG:
-        description: "选择 SukiSU 分支 // SukiSU branch"
+        description: "选择 SukiSU 分支"
         required: true
         type: choice
         options:
@@ -12,7 +12,7 @@ on:
           - SukiSU_stable
         default: SukiSU_dev
       SUSFS:
-        description: "启用 SUSFS // Enable SUSFS"
+        description: "启用 SUSFS"
         required: true
         type: choice
         options:
@@ -20,7 +20,7 @@ on:
           - disable
         default: enable
       VFS:
-        description: "启用 VFS 补丁（新的手动钩子） // Enable VFS patch"
+        description: "启用 VFS 补丁"
         required: true
         type: choice
         options:
@@ -28,7 +28,7 @@ on:
           - disable
         default: enable
       KPM:
-        description: "启用 KPM // Enable kernel patched modules"
+        description: "启用 KPM"
         required: true
         type: choice
         options:
@@ -36,7 +36,7 @@ on:
           - disable
         default: enable
       LZ4_ZSTD:
-        description: "启用 lz4/zstd 优化 // Enable lz4/zstd optimization"
+        description: "启用 lz4/zstd 优化"
         required: true
         type: choice
         options:
@@ -48,7 +48,7 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - name: Maximize build space # 最大化构建空间
+      - name: Maximize build space
         uses: easimon/maximize-build-space@master
         with:
           root-reserve-mb: 8192
@@ -59,70 +59,63 @@ jobs:
           remove-haskell: 'true'
           remove-codeql: 'true'
 
-      - name: Configure Git & Install dependencies # 配置 Git & 安装依赖
+      - name: Configure Git & Install dependencies
         run: |
           git config --global user.name "build-bot"
           git config --global user.email "bot@localhost"
-          # 关键修复: GitHub runner 在 Azure 上, 改用 azure.archive.ubuntu.com 镜像 (速度最快)
-          # 同时给 apt 加超时和重试, 避免卡死
           sudo sed -i 's|http://archive.ubuntu.com/ubuntu|http://azure.archive.ubuntu.com/ubuntu|g' /etc/apt/sources.list.d/ubuntu.sources 2>/dev/null || true
           sudo sed -i 's|http://security.ubuntu.com/ubuntu|http://azure.archive.ubuntu.com/ubuntu|g' /etc/apt/sources.list.d/ubuntu.sources 2>/dev/null || true
           sudo sed -i 's|http://archive.ubuntu.com/ubuntu|http://azure.archive.ubuntu.com/ubuntu|g' /etc/apt/sources.list 2>/dev/null || true
           sudo sed -i 's|http://security.ubuntu.com/ubuntu|http://azure.archive.ubuntu.com/ubuntu|g' /etc/apt/sources.list 2>/dev/null || true
-          # 不执行 apt upgrade (太慢), 只安装必需依赖, 带超时重试
           sudo apt update -o Acquire::Retries=5 -o Acquire::http::Timeout=30 -y
           sudo DEBIAN_FRONTEND=noninteractive apt install -y --no-install-recommends \
             -o Acquire::Retries=5 -o Acquire::http::Timeout=30 \
             python3 git curl wget unzip zip xz-utils zstd bc bison flex \
             libssl-dev libelf-dev libncurses-dev make ccache dwarves pahole rsync
 
-      - name: Install repo tool # 安装 repo 工具
+      - name: Install repo tool
         run: |
           curl -sSL https://storage.googleapis.com/git-repo-downloads/repo > ~/repo
           chmod a+x ~/repo
           sudo mv ~/repo /usr/local/bin/repo
 
-      # ============================================================
-      # 拉取 OPPO SM8475 官方开源内核 (Android 16 / 5.10.236)
-      # 两个仓库: common (GKI) + msm-kernel (厂商)
-      # ============================================================
       - name: Pull OPPO SM8475 kernel source
         run: |
           mkdir -p kernel_workspace/kernel_platform
           cd kernel_workspace/kernel_platform
-          # 公共 GKI 内核
           git clone --depth=1 https://github.com/oppo-source/android_kernel_common_oppo_sm8475 \
             -b oppo/sm8475_b_16.0_reno9_pro_plus common
-          # 厂商 msm 内核
           git clone --depth=1 https://github.com/oppo-source/android_kernel_oppo_sm8475 \
             -b oppo/sm8475_b_16.0_reno9_pro_plus msm-kernel
-          # 去除 -dirty 后缀
           sed -i 's/ -dirty//g' common/scripts/setlocalversion || true
           sed -i 's/ -dirty//g' msm-kernel/scripts/setlocalversion || true
           sed -i '$i res=$(echo "$res" | sed '\''s/-dirty//g'\'')' common/scripts/setlocalversion || true
+          # 关键修复: OPPO 开源不完整, 缺 kernel/oplus_cpu (vendor/oplus/kernel/cpu)
+          # 创建占位 Kconfig, 让 Kconfig 解析通过 (GKI 编译不需要 OPLUS 私有调度)
+          rm -rf common/kernel/oplus_cpu
+          mkdir -p common/kernel/oplus_cpu/sched
+          echo "# placeholder for OPLUS private cpu sched (not open-sourced)" > common/kernel/oplus_cpu/sched/Kconfig
+          echo 'source "kernel/oplus_cpu/sched/Kconfig"' > /dev/null
+          # 同时检查其他可能缺失的 oplus 引用, 创建占位
+          for d in oplus_mpam oplus_tencent oplus_sys oplus_healthinfo oplus_chg oplus_display oplus_secure; do
+            rm -rf common/kernel/$d
+            mkdir -p common/kernel/$d
+            touch common/kernel/$d/Kconfig
+          done
 
-      # ============================================================
-      # 下载预编译 clang 工具链 (与 OPPO 官方 build.config 一致)
-      # 使用 GitLab 镜像 (googlesource 在 CI 中不稳定)
-      # ============================================================
       - name: Download prebuilt clang
         run: |
           mkdir -p kernel_workspace/prebuilts-master/clang/host/linux-x86
           cd kernel_workspace/prebuilts-master/clang/host/linux-x86
-          # clang-r416183b - 从 CalyxOS GitLab 镜像下载 (与 OPPO build.config 完全一致)
           curl -L --retry 5 --retry-delay 5 -o clang-r416183b.tar.gz \
             "https://gitlab.com/CalyxOS/platform_prebuilts_clang_kernel_linux-x86_clang-r416183b/-/archive/android14/platform_prebuilts_clang_kernel_linux-x86_clang-r416183b-android14.tar.gz"
           ls -la clang-r416183b.tar.gz
           mkdir -p clang-r416183b
           tar -xzf clang-r416183b.tar.gz -C clang-r416183b --strip-components=1 || tar -xzf clang-r416183b.tar.gz -C clang-r416183b
           rm -f clang-r416183b.tar.gz
-          # 确认 clang 可执行
           ls -la clang-r416183b/bin/clang | head -1
           clang-r416183b/bin/clang --version | head -2 || true
 
-      # ============================================================
-      # 添加 SukiSU Ultra (内核内置)
-      # ============================================================
       - name: Add SukiSU Ultra
         run: |
           cd kernel_workspace/kernel_platform/common
@@ -137,9 +130,6 @@ jobs:
           export KSU_VERSION=$KSU_VERSION
           sed -i "s/DKSU_VERSION=12800/DKSU_VERSION=${KSU_VERSION}/" kernel/Makefile
 
-      # ============================================================
-      # 应用 SUSFS 补丁
-      # ============================================================
       - name: Apply SUSFS patches
         if: ${{ inputs.SUSFS == 'enable' }}
         run: |
@@ -151,14 +141,9 @@ jobs:
           cp ../../susfs4ksu/kernel_patches/fs/* ./fs/ 2>/dev/null || true
           cp ../../susfs4ksu/kernel_patches/include/linux/* ./include/linux/ 2>/dev/null || true
           patch -p1 -F 3 < 50_add_susfs_in_gki-android12-5.10.patch || true
-
-          # hide_stuff 补丁
           cp ../../SukiSU_patch/69_hide_stuff.patch ./
           patch -p1 -F 3 < 69_hide_stuff.patch || true
 
-      # ============================================================
-      # 应用 VFS 补丁
-      # ============================================================
       - name: Apply VFS patches
         if: ${{ inputs.VFS == 'enable' }}
         run: |
@@ -166,38 +151,27 @@ jobs:
           cp ../../SukiSU_patch/hooks/syscall_hooks.patch ./
           patch -p1 -F 3 < syscall_hooks.patch || true
 
-      # ============================================================
-      # 应用 lz4/zstd 补丁
-      # ============================================================
       - name: Apply lz4/zstd patches
         if: ${{ inputs.LZ4_ZSTD == 'enable' }}
         run: |
           cd kernel_workspace/kernel_platform/common
-          # lz4k 补丁 (SukiSU_patch 自带的)
           cp -r ../../SukiSU_patch/other/zram/lz4k/include/linux/* ./include/linux/ 2>/dev/null || true
           cp -r ../../SukiSU_patch/other/zram/lz4k/lib/* ./lib/ 2>/dev/null || true
           cp -r ../../SukiSU_patch/other/zram/lz4k/crypto/* ./crypto/ 2>/dev/null || true
           cp -r ../../SukiSU_patch/other/zram/lz4k_oplus ./lib/ 2>/dev/null || true
 
-      # ============================================================
-      # 内核配置 (SukiSU + SUSFS + KPM + VFS)
-      # ============================================================
       - name: Kernel configuration
         run: |
           cd kernel_workspace/kernel_platform
           CONFIG_FILE=./common/arch/arm64/configs/gki_defconfig
-          # SukiSU Ultra
           echo "CONFIG_KSU=y" >> "$CONFIG_FILE"
-          # KPM
           if [ "${{ inputs.KPM }}" = "enable" ]; then
             echo "CONFIG_KPM=y" >> "$CONFIG_FILE"
           fi
-          # VFS / hooks
           if [ "${{ inputs.VFS }}" = "enable" ]; then
             echo "CONFIG_KSU_MANUAL_HOOK=y" >> "$CONFIG_FILE"
             echo "CONFIG_KSU_WITH_KPROBES=n" >> "$CONFIG_FILE"
           fi
-          # SUSFS
           if [ "${{ inputs.SUSFS }}" = "enable" ]; then
             echo "CONFIG_KSU_SUSFS=y" >> "$CONFIG_FILE"
             echo "CONFIG_KSU_SUSFS_HAS_MAGIC_MOUNT=y" >> "$CONFIG_FILE"
@@ -215,7 +189,6 @@ jobs:
             echo "CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y" >> "$CONFIG_FILE"
             echo "CONFIG_KSU_SUSFS_OPEN_REDIRECT=y" >> "$CONFIG_FILE"
           fi
-          # lz4/zstd
           if [ "${{ inputs.LZ4_ZSTD }}" = "enable" ]; then
             echo "CONFIG_CRYPTO_LZ4=y" >> "$CONFIG_FILE"
             echo "CONFIG_CRYPTO_LZ4HC=y" >> "$CONFIG_FILE"
@@ -229,13 +202,9 @@ jobs:
             echo "CONFIG_TCP_CONG_BBR=y" >> "$CONFIG_FILE"
             echo "CONFIG_NET_SCH_FQ=y" >> "$CONFIG_FILE"
           fi
-          # 禁用 defconfig 审查 (避免 ABI 检查失败)
           sed -i 's/check_defconfig//' ./common/build.config.gki || true
           sed -i 's/check_defconfig//' ./msm-kernel/build.config.gki 2>/dev/null || true
 
-      # ============================================================
-      # 编译内核 (与 OPPO 官方 build.config 一致: clang-r416183b, LLVM=1)
-      # ============================================================
       - name: Build Kernel
         run: |
           export PATH="$GITHUB_WORKSPACE/kernel_workspace/prebuilts-master/clang/host/linux-x86/clang-r416183b/bin:$PATH"
@@ -245,24 +214,26 @@ jobs:
           MAKE_ARGS="LLVM=1 LLVM_IAS=1 ARCH=arm64 \
             CROSS_COMPILE=aarch64-linux-gnu- \
             LD=ld.lld HOSTLD=ld.lld KCFLAGS+=-Wno-error"
-          make -j$(nproc --all) O=out $MAKE_ARGS gki_defconfig
-          make -j$(nproc --all) O=out $MAKE_ARGS
+          make -j$(nproc --all) O=out $MAKE_ARGS gki_defconfig || {
+            echo "=== gki_defconfig 失败, 显示详细错误 ==="
+            make O=out $MAKE_ARGS gki_defconfig 2>&1 | tail -50
+            exit 1
+          }
+          make -j$(nproc --all) O=out $MAKE_ARGS || {
+            echo "=== 编译失败, 显示详细错误 ==="
+            make O=out $MAKE_ARGS 2>&1 | tail -80
+            exit 1
+          }
           ccache -s
-          # 确认产物
           find out -name "Image" -o -name "Image.gz" -o -name "*.ko" | head -20
 
-      # ============================================================
-      # 打包 AnyKernel3 (修复 BLOCK=auto 分区探测)
-      # ============================================================
       - name: Package AnyKernel3
         run: |
           git clone https://github.com/osm0sis/AnyKernel3 --depth=1
           rm -rf ./AnyKernel3/.git ./AnyKernel3/README.md
-          # 关键修复: BLOCK 改为 auto (自动探测 boot 分区, 适配 A/B 设备)
           sed -i "s|BLOCK=/dev/block/platform/omap/omap_hsmmc.0/by-name/boot;|BLOCK=auto;|" AnyKernel3/anykernel.sh
           sed -i "s/IS_SLOT_DEVICE=0/IS_SLOT_DEVICE=auto/" AnyKernel3/anykernel.sh
           sed -i "s/do.devicecheck=1/do.devicecheck=0/" AnyKernel3/anykernel.sh
-          # 放入编译好的内核镜像
           image_path=$(find "$GITHUB_WORKSPACE/kernel_workspace/kernel_platform/common/out/" -name "Image" | head -n 1)
           if [ -n "$image_path" ] && [ -f "$image_path" ]; then
             echo "Image located: $image_path"
@@ -273,9 +244,6 @@ jobs:
             exit 1
           fi
 
-      # ============================================================
-      # 上传产物
-      # ============================================================
       - name: Upload AnyKernel3
         uses: actions/upload-artifact@v4
         with:
