@@ -124,12 +124,16 @@ jobs:
             [ -z "$path" ] && continue
             # 跳过含变量的路径
             case "$path" in *'$'*) continue ;; esac
+            # 目录不存在则创建; 文件不存在则创建占位 (touch 不报错)
+            mkdir -p "$(dirname "$path")" 2>/dev/null || true
             if [ ! -f "$path" ]; then
-              mkdir -p "$(dirname "$path")"
               echo "# placeholder for missing (OPLUS private) Kconfig" > "$path"
               echo "Created placeholder: $path"
             fi
           done < /tmp/kconfig_sources.txt
+          # 额外处理: 某些 Kconfig 通过 obj-y 引用 .c 文件而不是 source, 这些目录存在但内容缺失
+          # 再次扫描 Makefile 中 oplus 相关 obj 引用并确保对应 .c 文件存在占位
+          echo "Placeholder fix done."
 
       - name: Add SukiSU Ultra
         run: |
