@@ -95,18 +95,22 @@ jobs:
 
       # ============================================================
       # 下载预编译 clang 工具链 (与 OPPO 官方 build.config 一致)
+      # 使用 GitLab 镜像 (googlesource 在 CI 中不稳定)
       # ============================================================
       - name: Download prebuilt clang
         run: |
           mkdir -p kernel_workspace/prebuilts-master/clang/host/linux-x86
           cd kernel_workspace/prebuilts-master/clang/host/linux-x86
-          # clang-r416183b (Android 官方预编译, 与 OPPO build.config 完全一致)
-          curl -LO --retry 5 --retry-delay 3 https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/master/clang-r416183b.tar.gz
+          # clang-r416183b - 从 CalyxOS GitLab 镜像下载 (与 OPPO build.config 完全一致)
+          curl -L --retry 5 --retry-delay 5 -o clang-r416183b.tar.gz \
+            "https://gitlab.com/CalyxOS/platform_prebuilts_clang_kernel_linux-x86_clang-r416183b/-/archive/android14/platform_prebuilts_clang_kernel_linux-x86_clang-r416183b-android14.tar.gz"
+          ls -la clang-r416183b.tar.gz
           mkdir -p clang-r416183b
-          tar -xzf clang-r416183b.tar.gz -C clang-r416183b
+          tar -xzf clang-r416183b.tar.gz -C clang-r416183b --strip-components=1 || tar -xzf clang-r416183b.tar.gz -C clang-r416183b
           rm -f clang-r416183b.tar.gz
           # 确认 clang 可执行
           ls -la clang-r416183b/bin/clang | head -1
+          clang-r416183b/bin/clang --version | head -2 || true
 
       # ============================================================
       # 添加 SukiSU Ultra (内核内置)
