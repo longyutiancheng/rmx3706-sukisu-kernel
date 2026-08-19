@@ -63,6 +63,11 @@ jobs:
         run: |
           git config --global user.name "build-bot"
           git config --global user.email "bot@localhost"
+          # 换成清华镜像源 (GitHub runner 访问 archive.ubuntu.com 经常很慢/卡死)
+          sudo sed -i 's|http://archive.ubuntu.com/ubuntu|https://mirrors.tuna.tsinghua.edu.cn/ubuntu|g' /etc/apt/sources.list.d/ubuntu.sources 2>/dev/null || true
+          sudo sed -i 's|http://security.ubuntu.com/ubuntu|https://mirrors.tuna.tsinghua.edu.cn/ubuntu|g' /etc/apt/sources.list.d/ubuntu.sources 2>/dev/null || true
+          sudo sed -i 's|http://archive.ubuntu.com/ubuntu|https://mirrors.tuna.tsinghua.edu.cn/ubuntu|g' /etc/apt/sources.list 2>/dev/null || true
+          sudo sed -i 's|http://security.ubuntu.com/ubuntu|https://mirrors.tuna.tsinghua.edu.cn/ubuntu|g' /etc/apt/sources.list 2>/dev/null || true
           # 不执行 apt upgrade (太慢), 只安装必需依赖
           sudo apt update -y
           sudo DEBIAN_FRONTEND=noninteractive apt install -y --no-install-recommends \
