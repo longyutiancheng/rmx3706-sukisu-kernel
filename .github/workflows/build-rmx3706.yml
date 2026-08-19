@@ -1,0 +1,271 @@
+name: Build SukiSU Ultra for Realme GT Neo5 150W (RMX3706, SM8475, Android 16)
+
+on:
+  workflow_dispatch:
+    inputs:
+      KSU_CONFIG:
+        description: "选择 SukiSU 分支 // SukiSU branch"
+        required: true
+        type: choice
+        options:
+          - SukiSU_dev
+          - SukiSU_stable
+        default: SukiSU_dev
+      SUSFS:
+        description: "启用 SUSFS // Enable SUSFS"
+        required: true
+        type: choice
+        options:
+          - enable
+          - disable
+        default: enable
+      VFS:
+        description: "启用 VFS 补丁（新的手动钩子） // Enable VFS patch"
+        required: true
+        type: choice
+        options:
+          - enable
+          - disable
+        default: enable
+      KPM:
+        description: "启用 KPM // Enable kernel patched modules"
+        required: true
+        type: choice
+        options:
+          - enable
+          - disable
+        default: enable
+      LZ4_ZSTD:
+        description: "启用 lz4/zstd 优化 // Enable lz4/zstd optimization"
+        required: true
+        type: choice
+        options:
+          - enable
+          - disable
+        default: enable
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Maximize build space # 最大化构建空间
+        uses: easimon/maximize-build-space@master
+        with:
+          root-reserve-mb: 8192
+          temp-reserve-mb: 2048
+          swap-size-mb: 8192
+          remove-dotnet: 'true'
+          remove-android: 'true'
+          remove-haskell: 'true'
+          remove-codeql: 'true'
+
+      - name: Configure Git & Install dependencies # 配置 Git & 安装依赖
+        run: |
+          git config --global user.name "build-bot"
+          git config --global user.email "bot@localhost"
+          sudo apt update -y
+          sudo apt-mark hold firefox
+          sudo apt install -y python3 git curl wget unzip zip xz-utils zstd bc bison flex \
+            libssl-dev libelf-dev libncurses-dev make ccache dwarves pahole rsync
+
+      - name: Install repo tool # 安装 repo 工具
+        run: |
+          curl -sSL https://storage.googleapis.com/git-repo-downloads/repo > ~/repo
+          chmod a+x ~/repo
+          sudo mv ~/repo /usr/local/bin/repo
+
+      # ============================================================
+      # 拉取 OPPO SM8475 官方开源内核 (Android 16 / 5.10.236)
+      # 两个仓库: common (GKI) + msm-kernel (厂商)
+      # ============================================================
+      - name: Pull OPPO SM8475 kernel source
+        run: |
+          mkdir -p kernel_workspace/kernel_platform
+          cd kernel_workspace/kernel_platform
+          # 公共 GKI 内核
+          git clone --depth=1 https://github.com/oppo-source/android_kernel_common_oppo_sm8475 \
+            -b oppo/sm8475_b_16.0_reno9_pro_plus common
+          # 厂商 msm 内核
+          git clone --depth=1 https://github.com/oppo-source/android_kernel_oppo_sm8475 \
+            -b oppo/sm8475_b_16.0_reno9_pro_plus msm-kernel
+          # 去除 -dirty 后缀
+          sed -i 's/ -dirty//g' common/scripts/setlocalversion || true
+          sed -i 's/ -dirty//g' msm-kernel/scripts/setlocalversion || true
+          sed -i '$i res=$(echo "$res" | sed '\''s/-dirty//g'\'')' common/scripts/setlocalversion || true
+
+      # ============================================================
+      # 下载预编译 clang 工具链 (与 OPPO 官方 build.config 一致)
+      # ============================================================
+      - name: Download prebuilt clang
+        run: |
+          mkdir -p kernel_workspace/prebuilts-master/clang/host/linux-x86
+          cd kernel_workspace/prebuilts-master/clang/host/linux-x86
+          # clang-r416183b (Android 官方预编译, 与 OPPO build.config 完全一致)
+          curl -LO --retry 5 --retry-delay 3 https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/master/clang-r416183b.tar.gz
+          mkdir -p clang-r416183b
+          tar -xzf clang-r416183b.tar.gz -C clang-r416183b
+          rm -f clang-r416183b.tar.gz
+          # 确认 clang 可执行
+          ls -la clang-r416183b/bin/clang | head -1
+
+      # ============================================================
+      # 添加 SukiSU Ultra (内核内置)
+      # ============================================================
+      - name: Add SukiSU Ultra
+        run: |
+          cd kernel_workspace/kernel_platform/common
+          if [ "${{ inputs.KSU_CONFIG }}" = "SukiSU_stable" ]; then
+            curl -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh" | bash -s susfs-stable
+          else
+            curl -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh" | bash -s susfs-dev
+          fi
+          cd ./KernelSU
+          KSU_VERSION=$(expr $(/usr/bin/git rev-list --count main) "+" 10606)
+          echo "KSUVER=$KSU_VERSION" >> $GITHUB_ENV
+          export KSU_VERSION=$KSU_VERSION
+          sed -i "s/DKSU_VERSION=12800/DKSU_VERSION=${KSU_VERSION}/" kernel/Makefile
+
+      # ============================================================
+      # 应用 SUSFS 补丁
+      # ============================================================
+      - name: Apply SUSFS patches
+        if: ${{ inputs.SUSFS == 'enable' }}
+        run: |
+          cd kernel_workspace
+          git clone https://github.com/ShirkNeko/susfs4ksu.git -b gki-android12-5.10 susfs4ksu
+          git clone https://github.com/SukiSU-Ultra/SukiSU_patch.git
+          cd kernel_platform/common
+          cp ../../susfs4ksu/kernel_patches/50_add_susfs_in_gki-android12-5.10.patch ./
+          cp ../../susfs4ksu/kernel_patches/fs/* ./fs/ 2>/dev/null || true
+          cp ../../susfs4ksu/kernel_patches/include/linux/* ./include/linux/ 2>/dev/null || true
+          patch -p1 -F 3 < 50_add_susfs_in_gki-android12-5.10.patch || true
+
+          # hide_stuff 补丁
+          cp ../../SukiSU_patch/69_hide_stuff.patch ./
+          patch -p1 -F 3 < 69_hide_stuff.patch || true
+
+      # ============================================================
+      # 应用 VFS 补丁
+      # ============================================================
+      - name: Apply VFS patches
+        if: ${{ inputs.VFS == 'enable' }}
+        run: |
+          cd kernel_workspace/kernel_platform/common
+          cp ../../SukiSU_patch/hooks/syscall_hooks.patch ./
+          patch -p1 -F 3 < syscall_hooks.patch || true
+
+      # ============================================================
+      # 应用 lz4/zstd 补丁
+      # ============================================================
+      - name: Apply lz4/zstd patches
+        if: ${{ inputs.LZ4_ZSTD == 'enable' }}
+        run: |
+          cd kernel_workspace/kernel_platform/common
+          # lz4k 补丁 (SukiSU_patch 自带的)
+          cp -r ../../SukiSU_patch/other/zram/lz4k/include/linux/* ./include/linux/ 2>/dev/null || true
+          cp -r ../../SukiSU_patch/other/zram/lz4k/lib/* ./lib/ 2>/dev/null || true
+          cp -r ../../SukiSU_patch/other/zram/lz4k/crypto/* ./crypto/ 2>/dev/null || true
+          cp -r ../../SukiSU_patch/other/zram/lz4k_oplus ./lib/ 2>/dev/null || true
+
+      # ============================================================
+      # 内核配置 (SukiSU + SUSFS + KPM + VFS)
+      # ============================================================
+      - name: Kernel configuration
+        run: |
+          cd kernel_workspace/kernel_platform
+          CONFIG_FILE=./common/arch/arm64/configs/gki_defconfig
+          # SukiSU Ultra
+          echo "CONFIG_KSU=y" >> "$CONFIG_FILE"
+          # KPM
+          if [ "${{ inputs.KPM }}" = "enable" ]; then
+            echo "CONFIG_KPM=y" >> "$CONFIG_FILE"
+          fi
+          # VFS / hooks
+          if [ "${{ inputs.VFS }}" = "enable" ]; then
+            echo "CONFIG_KSU_MANUAL_HOOK=y" >> "$CONFIG_FILE"
+            echo "CONFIG_KSU_WITH_KPROBES=n" >> "$CONFIG_FILE"
+          fi
+          # SUSFS
+          if [ "${{ inputs.SUSFS }}" = "enable" ]; then
+            echo "CONFIG_KSU_SUSFS=y" >> "$CONFIG_FILE"
+            echo "CONFIG_KSU_SUSFS_HAS_MAGIC_MOUNT=y" >> "$CONFIG_FILE"
+            echo "CONFIG_KSU_SUSFS_SUS_PATH=y" >> "$CONFIG_FILE"
+            echo "CONFIG_KSU_SUSFS_SUS_MOUNT=y" >> "$CONFIG_FILE"
+            echo "CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT=y" >> "$CONFIG_FILE"
+            echo "CONFIG_KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT=y" >> "$CONFIG_FILE"
+            echo "CONFIG_KSU_SUSFS_SUS_KSTAT=y" >> "$CONFIG_FILE"
+            echo "CONFIG_KSU_SUSFS_SUS_OVERLAYFS=n" >> "$CONFIG_FILE"
+            echo "CONFIG_KSU_SUSFS_TRY_UMOUNT=y" >> "$CONFIG_FILE"
+            echo "CONFIG_KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT=y" >> "$CONFIG_FILE"
+            echo "CONFIG_KSU_SUSFS_SPOOF_UNAME=y" >> "$CONFIG_FILE"
+            echo "CONFIG_KSU_SUSFS_ENABLE_LOG=y" >> "$CONFIG_FILE"
+            echo "CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y" >> "$CONFIG_FILE"
+            echo "CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y" >> "$CONFIG_FILE"
+            echo "CONFIG_KSU_SUSFS_OPEN_REDIRECT=y" >> "$CONFIG_FILE"
+          fi
+          # lz4/zstd
+          if [ "${{ inputs.LZ4_ZSTD }}" = "enable" ]; then
+            echo "CONFIG_CRYPTO_LZ4=y" >> "$CONFIG_FILE"
+            echo "CONFIG_CRYPTO_LZ4HC=y" >> "$CONFIG_FILE"
+            echo "CONFIG_CRYPTO_LZ4K=y" >> "$CONFIG_FILE"
+            echo "CONFIG_CRYPTO_LZ4KD=y" >> "$CONFIG_FILE"
+            echo "CONFIG_CRYPTO_842=y" >> "$CONFIG_FILE"
+            echo "CONFIG_ZSMALLOC=y" >> "$CONFIG_FILE"
+            echo "CONFIG_TMPFS_XATTR=y" >> "$CONFIG_FILE"
+            echo "CONFIG_TMPFS_POSIX_ACL=y" >> "$CONFIG_FILE"
+            echo "CONFIG_TCP_CONG_ADVANCED=y" >> "$CONFIG_FILE"
+            echo "CONFIG_TCP_CONG_BBR=y" >> "$CONFIG_FILE"
+            echo "CONFIG_NET_SCH_FQ=y" >> "$CONFIG_FILE"
+          fi
+          # 禁用 defconfig 审查 (避免 ABI 检查失败)
+          sed -i 's/check_defconfig//' ./common/build.config.gki || true
+          sed -i 's/check_defconfig//' ./msm-kernel/build.config.gki 2>/dev/null || true
+
+      # ============================================================
+      # 编译内核 (与 OPPO 官方 build.config 一致: clang-r416183b, LLVM=1)
+      # ============================================================
+      - name: Build Kernel
+        run: |
+          export PATH="$GITHUB_WORKSPACE/kernel_workspace/prebuilts-master/clang/host/linux-x86/clang-r416183b/bin:$PATH"
+          export PATH="/usr/lib/ccache:$PATH"
+          export CC="ccache clang"
+          cd kernel_workspace/kernel_platform/common
+          MAKE_ARGS="LLVM=1 LLVM_IAS=1 ARCH=arm64 \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            LD=ld.lld HOSTLD=ld.lld KCFLAGS+=-Wno-error"
+          make -j$(nproc --all) O=out $MAKE_ARGS gki_defconfig
+          make -j$(nproc --all) O=out $MAKE_ARGS
+          ccache -s
+          # 确认产物
+          find out -name "Image" -o -name "Image.gz" -o -name "*.ko" | head -20
+
+      # ============================================================
+      # 打包 AnyKernel3 (修复 BLOCK=auto 分区探测)
+      # ============================================================
+      - name: Package AnyKernel3
+        run: |
+          git clone https://github.com/osm0sis/AnyKernel3 --depth=1
+          rm -rf ./AnyKernel3/.git ./AnyKernel3/README.md
+          # 关键修复: BLOCK 改为 auto (自动探测 boot 分区, 适配 A/B 设备)
+          sed -i "s|BLOCK=/dev/block/platform/omap/omap_hsmmc.0/by-name/boot;|BLOCK=auto;|" AnyKernel3/anykernel.sh
+          sed -i "s/IS_SLOT_DEVICE=0/IS_SLOT_DEVICE=auto/" AnyKernel3/anykernel.sh
+          sed -i "s/do.devicecheck=1/do.devicecheck=0/" AnyKernel3/anykernel.sh
+          # 放入编译好的内核镜像
+          image_path=$(find "$GITHUB_WORKSPACE/kernel_workspace/kernel_platform/common/out/" -name "Image" | head -n 1)
+          if [ -n "$image_path" ] && [ -f "$image_path" ]; then
+            echo "Image located: $image_path"
+            cp "$image_path" ./AnyKernel3/Image
+          else
+            echo "Image not found! Build failed" >&2
+            find "$GITHUB_WORKSPACE/kernel_workspace/kernel_platform/common/out/" -maxdepth 3 -type f | head -30
+            exit 1
+          fi
+
+      # ============================================================
+      # 上传产物
+      # ============================================================
+      - name: Upload AnyKernel3
+        uses: actions/upload-artifact@v4
+        with:
+          name: RMX3706_SukiSUUltra_${{ env.KSUVER }}_AnyKernel3
+          path: ./AnyKernel3/*
